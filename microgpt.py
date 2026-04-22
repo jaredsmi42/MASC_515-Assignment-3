@@ -7,7 +7,7 @@ Everything else is just efficiency.
 """
 
 import os       # os.path.exists
-import math     # math.log, math.exp
+import math     # math.log, math.exp, math.tanh
 import random   # random.seed, random.choices, random.gauss, random.shuffle
 random.seed(42) # Let there be order among chaos
 
@@ -44,27 +44,72 @@ class Value:
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data * other.data, (self, other), (other.data, self.data))
 
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
+    def __pow__(self, other):
+        return Value(self.data**other, (self,), (other * self.data**(other-1),))
+
+    def log(self):
+        return Value(math.log(self.data), (self,), (1/self.data,))
+
+    def exp(self):
+        return Value(math.exp(self.data), (self,), (math.exp(self.data),))
+
+    def tanh(self):
+        # GELU ADDITION:
+        # This adds tanh to the autograd engine so GELU can be built from differentiable operations.
+        # d/dx tanh(x) = 1 - tanh(x)^2
+        t = math.tanh(self.data)
+        return Value(t, (self,), (1 - t * t,))
+
+    def relu(self):
+        return Value(max(0, self.data), (self,), (float(self.data > 0),))
+
+    def gelu(self):
+        # GELU ADDITION:
+        # GELU = Gaussian Error Linear Unit
+        # Unlike ReLU, which hard-cuts all negative values to zero,
+        # GELU smoothly scales inputs based on their magnitude.
+        #
+        # Standard tanh-based approximation:
+        # GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+        #
+        # This is commonly used in transformer models because it gives a
+        # smoother nonlinearity than ReLU and preserves more information.
+        c = (2 / math.pi) ** 0.5
+        inner = c * (self + 0.044715 * (self ** 3))
+        return 0.5 * self * (1 + inner.tanh())
+
+    def __neg__(self):
+        return self * -1
+
+    def __radd__(self, other):
+        return self + other
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __rsub__(self, other):
+        return other + (-self)
+
+    def __rmul__(self, other):
+        return self * other
+
+    def __truediv__(self, other):
+        return self * other**-1
+
+    def __rtruediv__(self, other):
+        return other * self**-1
 
     def backward(self):
         topo = []
         visited = set()
+
         def build_topo(v):
             if v not in visited:
                 visited.add(v)
                 for child in v._children:
                     build_topo(child)
                 topo.append(v)
+
         build_topo(self)
         self.grad = 1
         for v in reversed(topo):
@@ -90,7 +135,7 @@ params = [p for mat in state_dict.values() for row in mat for p in row] # flatte
 print(f"num params: {len(params)}")
 
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU in MLP
 def linear(x, w):
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
@@ -132,11 +177,20 @@ def gpt(token_id, pos_id, keys, values):
             x_attn.extend(head_out)
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
+
         # 2) MLP block
         x_residual = x
         x = rmsnorm(x)
         x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
+
+        # GELU CHANGE:
+        # Original code used:
+        # x = [xi.relu() for xi in x]
+        #
+        # This now uses GELU so the network applies a smooth nonlinearity
+        # instead of a hard zeroing of negative values.
+        x = [xi.gelu() for xi in x]
+
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 
