@@ -44,53 +44,102 @@ class Value:
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data * other.data, (self, other), (other.data, self.data))
 
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
+    def __pow__(self, other):
+        return Value(self.data**other, (self,), (other * self.data**(other-1),))
+
+    def log(self):
+        return Value(math.log(self.data), (self,), (1/self.data,))
+
+    def exp(self):
+        return Value(math.exp(self.data), (self,), (math.exp(self.data),))
+
+    def relu(self):
+        return Value(max(0, self.data), (self,), (float(self.data > 0),))
+
+    def __neg__(self):
+        return self * -1
+
+    def __radd__(self, other):
+        return self + other
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __rsub__(self, other):
+        return other + (-self)
+
+    def __rmul__(self, other):
+        return self * other
+
+    def __truediv__(self, other):
+        return self * other**-1
+
+    def __rtruediv__(self, other):
+        return other * self**-1
 
     def backward(self):
         topo = []
         visited = set()
+
         def build_topo(v):
             if v not in visited:
                 visited.add(v)
                 for child in v._children:
                     build_topo(child)
                 topo.append(v)
+
         build_topo(self)
         self.grad = 1
         for v in reversed(topo):
             for child, local_grad in zip(v._children, v._local_grads):
                 child.grad += local_grad * v.grad
 
+
 # Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
 n_embd = 16     # width of the network (embedding dimension)
-block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
+block_size = 16 # maximum context length of the attention window
 n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
+
+# MoE ADDITION:
+# Number of experts used in the MoE feed-forward block.
+# Each token is routed by a learned gate across these experts.
+n_experts = 3
+
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+
+state_dict = {
+    'wte': matrix(vocab_size, n_embd),
+    'wpe': matrix(block_size, n_embd),
+    'lm_head': matrix(vocab_size, n_embd)
+}
+
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+
+    # MoE ADDITION:
+    # Replace the single MLP with:
+    # 1) a router that scores which expert(s) should process the token
+    # 2) a set of expert MLPs, each with its own fc1/fc2 weights
+    #
+    # router: maps token representation -> expert scores
+    state_dict[f'layer{i}.moe_router'] = matrix(n_experts, n_embd)
+
+    # expert e: fc1 expands n_embd -> 4*n_embd
+    # expert e: fc2 projects 4*n_embd -> n_embd
+    for e in range(n_experts):
+        state_dict[f'layer{i}.expert{e}.fc1'] = matrix(4 * n_embd, n_embd)
+        state_dict[f'layer{i}.expert{e}.fc2'] = matrix(n_embd, 4 * n_embd)
+
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
 
+
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
 def linear(x, w):
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
@@ -104,6 +153,41 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+
+def moe_ffn(x, layer_idx):
+    """
+    MoE ADDITION:
+    This is a simple Mixture-of-Experts feed-forward block.
+
+    How it works:
+    1) The router computes a score for each expert from the token representation x.
+    2) The router scores are softmaxed into routing probabilities.
+    3) Every expert processes x through its own MLP.
+    4) The final MoE output is the weighted sum of all expert outputs.
+
+    Note:
+    This is a dense/soft MoE for simplicity and compatibility with this tiny autograd engine.
+    Production MoE models often use sparse top-k routing instead.
+    """
+    # Router decides how much weight to assign to each expert
+    router_logits = linear(x, state_dict[f'layer{layer_idx}.moe_router'])
+    router_probs = softmax(router_logits)  # one probability per expert
+
+    # Run x through every expert MLP
+    expert_outputs = []
+    for e in range(n_experts):
+        h = linear(x, state_dict[f'layer{layer_idx}.expert{e}.fc1'])
+        h = [hi.relu() for hi in h]
+        y = linear(h, state_dict[f'layer{layer_idx}.expert{e}.fc2'])
+        expert_outputs.append(y)
+
+    # Weighted sum of expert outputs using router probabilities
+    out = []
+    for j in range(n_embd):
+        mixed = sum(router_probs[e] * expert_outputs[e][j] for e in range(n_experts))
+        out.append(mixed)
+
+    return out
 
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
@@ -121,6 +205,7 @@ def gpt(token_id, pos_id, keys, values):
         keys[li].append(k)
         values[li].append(v)
         x_attn = []
+
         for h in range(n_head):
             hs = h * head_dim
             q_h = q[hs:hs+head_dim]
@@ -130,18 +215,28 @@ def gpt(token_id, pos_id, keys, values):
             attn_weights = softmax(attn_logits)
             head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
             x_attn.extend(head_out)
+
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
-        # 2) MLP block
+
+        # 2) MLP block -> replaced with MoE block
         x_residual = x
         x = rmsnorm(x)
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+
+        # MoE ADDITION:
+        # Original code used a single shared feed-forward network:
+        #   x = linear(x, mlp_fc1)
+        #   x = relu(x)
+        #   x = linear(x, mlp_fc2)
+        #
+        # New code routes the token through multiple experts and blends them.
+        x = moe_ffn(x, li)
+
         x = [a + b for a, b in zip(x, x_residual)]
 
     logits = linear(x, state_dict['lm_head'])
     return logits
+
 
 # Let there be Adam, the blessed optimizer and its buffers
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
@@ -182,6 +277,7 @@ for step in range(num_steps):
         p.grad = 0
 
     print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
+
 
 # Inference: may the model babble back to us
 temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
