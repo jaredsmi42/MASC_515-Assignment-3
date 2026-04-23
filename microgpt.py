@@ -7,7 +7,7 @@ Everything else is just efficiency.
 """
 
 import os       # os.path.exists
-import math     # math.log, math.exp
+import math     # math.log, math.exp, math.sin, math.cos
 import random   # random.seed, random.choices, random.gauss, random.shuffle
 random.seed(42) # Let there be order among chaos
 
@@ -74,11 +74,21 @@ class Value:
 # Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
 n_embd = 16     # width of the network (embedding dimension)
-block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
+block_size = 16 # maximum context length of the attention window
 n_head = 4      # number of attention heads
 head_dim = n_embd // n_head # derived dimension of each head
+
+# RoPE works on pairs of dimensions, so head_dim should be even
+assert head_dim % 2 == 0, "RoPE requires an even head_dim"
+
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+
+state_dict = {
+    'wte': matrix(vocab_size, n_embd),
+    'wpe': matrix(block_size, n_embd),   # kept here to minimize changes to the script structure
+    'lm_head': matrix(vocab_size, n_embd)
+}
+
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
@@ -86,11 +96,11 @@ for i in range(n_layer):
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
 
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
 def linear(x, w):
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
@@ -105,33 +115,111 @@ def rmsnorm(x):
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
+# -----------------------------------------------------------------------------
+# RoPE ADDITION:
+# RoPE rotates each 2D pair of coordinates in q and k by a position-dependent angle.
+# This lets attention capture relative position information directly inside q·k.
+#
+# For each pair (x_even, x_odd):
+#   x'_even = x_even * cos(theta) - x_odd * sin(theta)
+#   x'_odd  = x_even * sin(theta) + x_odd * cos(theta)
+#
+# The angle theta depends on token position and dimension index.
+# -----------------------------------------------------------------------------
+def apply_rope(x, pos_id):
+    """
+    Apply Rotary Position Embedding to a single head vector x.
+
+    x: list[Value] with length = head_dim
+    pos_id: integer token position
+    """
+    out = []
+    half_pairs = len(x) // 2
+
+    for i in range(half_pairs):
+        # RoPE frequency schedule
+        # Common form: theta_i = pos / (10000^(2i/d))
+        theta = pos_id / (10000 ** (2 * i / len(x)))
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        x_even = x[2 * i]
+        x_odd  = x[2 * i + 1]
+
+        # Rotate the 2D pair
+        rotated_even = x_even * cos_t - x_odd * sin_t
+        rotated_odd  = x_even * sin_t + x_odd * cos_t
+
+        out.append(rotated_even)
+        out.append(rotated_odd)
+
+    return out
+
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
-    pos_emb = state_dict['wpe'][pos_id] # position embedding
-    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+
+    # RoPE NOTE:
+    # In a standard RoPE setup, the model often does NOT rely on learned absolute
+    # position embeddings in the attention path. To keep this microgpt simple and
+    # explicitly RoPE-based, we remove the learned position addition from x here.
+    #
+    # Original:
+    # pos_emb = state_dict['wpe'][pos_id]
+    # x = [t + p for t, p in zip(tok_emb, pos_emb)]
+    #
+    # New:
+    x = tok_emb[:]
+
     x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
 
     for li in range(n_layer):
         # 1) Multi-head Attention block
         x_residual = x
         x = rmsnorm(x)
+
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
+
+        # Store k and v for causal attention over previous tokens
         keys[li].append(k)
         values[li].append(v)
+
         x_attn = []
         for h in range(n_head):
             hs = h * head_dim
+
+            # Slice out one head
             q_h = q[hs:hs+head_dim]
-            k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
+            k_h_all = [ki[hs:hs+head_dim] for ki in keys[li]]
             v_h = [vi[hs:hs+head_dim] for vi in values[li]]
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+
+            # -----------------------------------------------------------------
+            # RoPE ADDITION:
+            # Apply rotary embedding to:
+            #   - current query q_h at current position pos_id
+            #   - every stored key k_h_all[t] at its own source position t
+            #
+            # This is the core RoPE mechanism.
+            # -----------------------------------------------------------------
+            q_h = apply_rope(q_h, pos_id)
+            k_h_all = [apply_rope(k_h_all[t], t) for t in range(len(k_h_all))]
+
+            attn_logits = [
+                sum(q_h[j] * k_h_all[t][j] for j in range(head_dim)) / head_dim**0.5
+                for t in range(len(k_h_all))
+            ]
             attn_weights = softmax(attn_logits)
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+
+            head_out = [
+                sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h)))
+                for j in range(head_dim)
+            ]
             x_attn.extend(head_out)
+
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
+
         # 2) MLP block
         x_residual = x
         x = rmsnorm(x)
